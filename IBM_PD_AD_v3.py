@@ -1755,7 +1755,7 @@ general_config = {
             # 39.7% relative increase from 2020-2050 (30 years)
             # Adjusted to 2023-2040 (17 years): 22.5% relative increase
             'prevalence_schedule': {
-                'use': False,  # Set to True to enable growth scenario
+                'use': True,  # Set to True to enable growth scenario
                 'baseline_year': 2023,
                 'baseline_prevalence': {'female': 0.50, 'male': 0.50},
                 'target_year': 2040,
@@ -2076,6 +2076,84 @@ def ensure_background_mortality_hazards_by_year(config: dict) -> None:
                         converted[year_int][_canonicalize_sex(sex_key)][age_int] = _qx_to_hazard(qx_val)
             config['background_mortality_hazards_by_year'] = converted
         return
+
+def update_pd_prevalence_for_existing(population_state: Dict[int, dict],
+                                      config: dict,
+                                      calendar_year: int) -> None:
+    """Update periodontal disease status for existing alive individuals to match the
+    scheduled population prevalence for this calendar year.
+
+    PD is irreversible at this age: the function performs a one-directional Bernoulli
+    flip for currently PD-negative individuals only. The per-person annual conversion
+    probability is derived from the prevalence schedule via:
+
+        p_convert = (p_target - p_current) / (1 - p_current)
+
+    where p_current is the observed PD prevalence among alive individuals of each sex,
+    and p_target is the scheduled target for this calendar year. This ensures the
+    population-level prevalence tracks the Elamin & Ansah (2023) projection regardless
+    of differential mortality, which would otherwise dilute the exposed stock.
+
+    This function is a no-op when the periodontal_disease prevalence_schedule has
+    'use': False, or when p_target <= p_current (no net conversion needed).
+    """
+    rf_cfg = config.get('risk_factors', {}).get('periodontal_disease', {})
+    schedule = rf_cfg.get('prevalence_schedule', {})
+    if not schedule.get('use', False):
+        return
+
+    # Compute per-sex target prevalence for this year from the schedule
+    baseline_year = int(schedule.get('baseline_year', 2023))
+    target_year = int(schedule.get('target_year', 2040))
+    baseline_prev = schedule.get('baseline_prevalence', {})
+    target_prev = schedule.get('target_prevalence', {})
+
+    for sex in ('female', 'male'):
+        try:
+            p_baseline = float(resolve_risk_value(baseline_prev, 65, sex))
+            p_target_end = float(resolve_risk_value(target_prev, 65, sex))
+        except (TypeError, ValueError):
+            p_baseline = 0.50
+            p_target_end = 0.6125
+
+        # Scheduled target for this calendar year (linear interpolation)
+        if calendar_year <= baseline_year:
+            p_target = p_baseline
+        elif calendar_year >= target_year:
+            p_target = p_target_end
+        else:
+            progress = (calendar_year - baseline_year) / (target_year - baseline_year)
+            p_target = p_baseline + progress * (p_target_end - p_baseline)
+
+        # Count current PD prevalence among alive individuals of this sex
+        alive_this_sex = [
+            p for p in population_state.values()
+            if p.get('alive', False) and _canonical_sex_label(p.get('sex')) == sex
+        ]
+        if not alive_this_sex:
+            continue
+
+        n_alive = len(alive_this_sex)
+        n_pd_positive = sum(1 for p in alive_this_sex if p['risk_factors'].get('periodontal_disease', False))
+        p_current = n_pd_positive / n_alive
+
+        # No conversion needed if current prevalence already meets or exceeds target
+        if p_target <= p_current:
+            continue
+
+        # Conversion probability for currently PD-negative individuals
+        p_neg = 1.0 - p_current
+        if p_neg <= 0.0:
+            continue
+        p_convert = (p_target - p_current) / p_neg
+        p_convert = max(0.0, min(1.0, p_convert))
+
+        # One-directional flip: PD-negative individuals only
+        for person in alive_this_sex:
+            if not person['risk_factors'].get('periodontal_disease', False):
+                if random.random() < p_convert:
+                    person['risk_factors']['periodontal_disease'] = True
+
 
 def add_new_entrants(population_state: Dict[int, dict],
                      config: dict,
@@ -3711,6 +3789,12 @@ def run_model(config: dict, seed: Optional[int] = None, return_agents: bool = Fa
         advance_population_state(population_state, config, calendar_year)
 
         next_id, entrants_this_step = add_new_entrants(population_state, config, next_id, calendar_year)
+
+        # Update PD prevalence for existing stock to track the scheduled growth trajectory.
+        # New entrants are already assigned the current-year prevalence in add_new_entrants,
+        # so this pass only needs to convert PD-negative individuals in the surviving stock.
+        update_pd_prevalence_for_existing(population_state, config, calendar_year)
+
         per_sex_exposure: Dict[str, Dict[Tuple[int, Optional[int]], float]] = {}
         per_sex_onsets: Dict[str, Dict[Tuple[int, Optional[int]], int]] = {}
 
@@ -6166,4 +6250,3 @@ if __name__ == "__main__":
 
     if os.environ.get("RUN_CALIBRATION_PLOTS", "0") == "1":
         run_calibration_prevalence_plots()
-
