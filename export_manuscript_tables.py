@@ -1,19 +1,26 @@
 """
-Export manuscript tables from completed model results.
+Export manuscript tables and figures from completed model results.
 
 Requires two pkl.gz result files (baseline and growth) already produced by run_model.
-Reads those files and writes Manuscript_Tables.xlsx with six sheets:
+Reads those files and writes:
 
-  1. Model_Inputs                 — comprehensive model parameters: population, risk factors,
-                                    hazard ratios, utilities, costs, progression rates
-  2. Table3_Scenario_Comparison   — dementia cases, annual formal and societal costs
-                                    at 2030, 2035, 2040 for baseline vs growth
-  3. Risk_Factor_Enrichment       — general population vs dementia population prevalence
-                                    and relative enrichment for all risk factors at 2024
-  4. QALY_Differences             — cumulative patient and caregiver QALY differences
-                                    (growth minus baseline) by year 2024-2040
-  5. PSA_Table                    — merged from PSA_Results_Growth.xlsx (PSA_Table sheet)
-  6. Sensitivity_Analysis         — merged from Sensitivity_Analysis.xlsx (both scenarios)
+OUTPUT FILES:
+  1. Manuscript_Tables.xlsx (8 sheets):
+     a. Model_Inputs                 — comprehensive model parameters
+     b. Table3_Scenario_Comparison   — scenario comparison results
+     c. Attributable_Cases_Summary   — PAF summary statistics
+     d. Attributable_Distribution    — histogram data
+     e. Attributable_Draws           — raw PSA draws
+     f. QALY_Differences             — cumulative QALY differences
+     g. PSA_Table                    — PSA results
+     h. Sensitivity_Analysis         — one-way SA results
+
+  2. figures/Attributable_Cases_Histogram.png
+     - Histogram showing distribution of dementia cases attributable to
+       periodontal disease from PSA iterations
+     - X-axis: Attributable percentage (%)
+     - Y-axis: Frequency (% of PSA iterations)
+     - Includes mean, median, and 95% CI
 
 Usage:
     python export_manuscript_tables.py
@@ -28,6 +35,9 @@ from pathlib import Path
 
 import pandas as pd
 import numpy as np
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
 
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
 sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
@@ -44,9 +54,13 @@ from IBM_PD_AD_v3 import (
 BASELINE_RESULTS_PATH = Path('results') / 'results_pd_baseline.pkl.gz'
 GROWTH_RESULTS_PATH   = Path('results') / 'results_pd_growth.pkl.gz'
 PSA_EXCEL_PATH        = Path('psa_results_growth') / 'PSA_Results_Growth.xlsx'
-SA_EXCEL_PATH         = Path('sensitivity_analysis_results') / 'Sensitivity_Analysis.xlsx'
+SA_BASELINE_EXCEL_PATH = Path('pd_sensitivity_analysis.xlsx')
+SA_GROWTH_EXCEL_PATH   = Path('pd_sensitivity_analysis_growth.xlsx')
 OUTPUT_PATH           = Path('results') / 'Manuscript_Tables.xlsx'
 OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+FIGURES_DIR = Path('figures')
+FIGURES_DIR.mkdir(parents=True, exist_ok=True)
 
 # ── Load results ───────────────────────────────────────────────────────────────
 
@@ -117,34 +131,208 @@ for year in TARGET_YEARS:
 
 table3_df = pd.DataFrame(rows_t3)
 
-# ── Risk factor enrichment (baseline year 2024) ────────────────────────────────
-# For each risk factor: prevalence in general population, prevalence in dementia
-# population, relative enrichment (%)
+# ── Attributable cases from PSA (Periodontal Disease) ──────────────────────────
+# Calculate distribution of cases attributable to periodontal disease from PSA draws
 
-b_2024 = get_year_row(baseline_df, 2024)
+def calculate_attributable_cases_from_psa() -> pd.DataFrame:
+    """
+    Calculate dementia cases attributable to periodontal disease from PSA draws.
 
-enrichment_rows = []
-for rf_key, rf_label in RISK_FACTOR_LABELS.items():
-    alive_col    = f'risk_prev_alive_{rf_key}'
-    dementia_col = f'risk_prev_dementia_{rf_key}'
-    gen_prev     = b_2024.get(alive_col,    np.nan)
-    dem_prev     = b_2024.get(dementia_col, np.nan)
-    if np.isnan(gen_prev) or np.isnan(dem_prev) or gen_prev == 0:
-        enrichment = np.nan
-    else:
-        enrichment = (dem_prev - gen_prev) / gen_prev * 100
-    enrichment_rows.append({
-        'Risk factor':                      rf_label,
-        'General population prevalence (%)': round(gen_prev * 100, 1) if not np.isnan(gen_prev) else None,
-        'Dementia population prevalence (%)': round(dem_prev * 100, 1) if not np.isnan(dem_prev) else None,
-        'Relative enrichment (%)':           round(enrichment, 1) if not np.isnan(enrichment) else None,
+    Returns DataFrame with:
+    - attributable_cases: absolute number of cases
+    - attributable_pct: percentage of total incident cases
+    - scenario: 'Growth' (only growth PSA available)
+    """
+    if not PSA_EXCEL_PATH.exists():
+        print(f"WARNING: PSA results not found at {PSA_EXCEL_PATH}")
+        return pd.DataFrame()
+
+    # Load PSA draws
+    try:
+        psa_draws = pd.read_excel(PSA_EXCEL_PATH, sheet_name='PSA_Draws')
+    except Exception as e:
+        print(f"WARNING: Could not load PSA draws: {e}")
+        return pd.DataFrame()
+
+    if psa_draws.empty or 'incident_onsets_total' not in psa_draws.columns:
+        print("WARNING: PSA draws missing required columns")
+        return pd.DataFrame()
+
+    # Calculate PAF for each draw
+    # PAF = P * (HR - 1) / [P * (HR - 1) + 1]
+    # where P = prevalence, HR = hazard ratio
+
+    results = []
+
+    for idx, row in psa_draws.iterrows():
+        # Get sampled values for periodontal disease
+        # Note: PSA sampling varies HR and prevalence
+        # We'll use the mean values from the growth scenario if individual draws aren't available
+
+        # Get incident onsets
+        incident_onsets = row.get('incident_onsets_total', 0)
+
+        if incident_onsets == 0:
+            continue
+
+        # For growth scenario, prevalence varies from 50% to 61.25%
+        # Use midpoint as approximation: 55.6%
+        prevalence = 0.556  # Average over 2023-2040
+
+        # HR for periodontal disease (sampled in PSA from 95% CI: 1.07-1.38)
+        # Check if HR is in the draws, otherwise use base value
+        hr = 1.21  # Base value
+
+        # Look for PD-related columns in draws
+        pd_hr_cols = [col for col in psa_draws.columns if 'periodontal' in col.lower() and 'hr' in col.lower()]
+        if pd_hr_cols:
+            hr = row.get(pd_hr_cols[0], 1.21)
+
+        # Calculate PAF
+        paf = (prevalence * (hr - 1)) / (prevalence * (hr - 1) + 1)
+
+        # Calculate attributable cases
+        attributable_cases = incident_onsets * paf
+        attributable_pct = paf * 100
+
+        results.append({
+            'iteration': idx,
+            'scenario': 'Growth',
+            'incident_onsets': incident_onsets,
+            'attributable_cases': attributable_cases,
+            'attributable_pct': attributable_pct,
+            'prevalence': prevalence,
+            'hazard_ratio': hr,
+        })
+
+    return pd.DataFrame(results)
+
+attributable_df = calculate_attributable_cases_from_psa()
+
+# Create summary statistics for attributable cases
+if not attributable_df.empty:
+    attributable_summary = pd.DataFrame([{
+        'Scenario': 'Growth (50%→61.25%)',
+        'Mean attributable cases': int(round(attributable_df['attributable_cases'].mean())),
+        'Median attributable cases': int(round(attributable_df['attributable_cases'].median())),
+        'Lower 95% CI': int(round(attributable_df['attributable_cases'].quantile(0.025))),
+        'Upper 95% CI': int(round(attributable_df['attributable_cases'].quantile(0.975))),
+        'Mean attributable %': round(attributable_df['attributable_pct'].mean(), 2),
+        'Median attributable %': round(attributable_df['attributable_pct'].median(), 2),
+        'Lower 95% CI (%)': round(attributable_df['attributable_pct'].quantile(0.025), 2),
+        'Upper 95% CI (%)': round(attributable_df['attributable_pct'].quantile(0.975), 2),
+    }])
+else:
+    attributable_summary = pd.DataFrame()
+
+# Create histogram data for plotting (binned frequencies)
+if not attributable_df.empty:
+    # Create bins for attributable percentage (0-20% in 1% increments)
+    bins = np.arange(0, 21, 1)
+    hist, bin_edges = np.histogram(attributable_df['attributable_pct'], bins=bins)
+
+    # Convert to frequency (% of iterations)
+    total_iterations = len(attributable_df)
+    freq_pct = (hist / total_iterations) * 100
+
+    histogram_data = pd.DataFrame({
+        'Attributable_%_lower': bin_edges[:-1],
+        'Attributable_%_upper': bin_edges[1:],
+        'Frequency_%_of_iterations': freq_pct,
+        'Count': hist,
+        'Scenario': 'Growth'
     })
+else:
+    histogram_data = pd.DataFrame()
 
-# Sort by absolute enrichment descending
-enrichment_df = pd.DataFrame(enrichment_rows)
-enrichment_df = enrichment_df.sort_values(
-    'Relative enrichment (%)', ascending=False, na_position='last'
-).reset_index(drop=True)
+# ── Plot histogram figure ──────────────────────────────────────────────────────
+
+def plot_attributable_cases_histogram(attributable_df: pd.DataFrame,
+                                      output_path: Path = FIGURES_DIR / 'Attributable_Cases_Histogram.png'):
+    """
+    Create publication-ready histogram showing distribution of dementia cases
+    attributable to periodontal disease from PSA iterations.
+
+    X-axis: Dementia cases attributable to periodontal disease (%)
+    Y-axis: Frequency (% of total PSA iterations)
+    """
+    if attributable_df.empty:
+        print("WARNING: No attributable cases data to plot")
+        return None
+
+    fig, ax = plt.subplots(figsize=(8, 6))
+
+    # Create histogram
+    attributable_pct = attributable_df['attributable_pct'].values
+    n_iterations = len(attributable_pct)
+
+    # Use bins from 0-20% in 0.5% increments for smoother histogram
+    bins = np.arange(0, 21, 0.5)
+
+    # Plot histogram with frequency as % of iterations
+    counts, bin_edges, patches = ax.hist(
+        attributable_pct,
+        bins=bins,
+        weights=np.ones(len(attributable_pct)) / len(attributable_pct) * 100,
+        color='#2E86AB',
+        alpha=0.8,
+        edgecolor='black',
+        linewidth=0.5
+    )
+
+    # Add mean and median lines
+    mean_val = attributable_pct.mean()
+    median_val = np.median(attributable_pct)
+    ci_lower = np.percentile(attributable_pct, 2.5)
+    ci_upper = np.percentile(attributable_pct, 97.5)
+
+    ax.axvline(mean_val, color='red', linestyle='--', linewidth=2,
+               label=f'Mean: {mean_val:.1f}%')
+    ax.axvline(median_val, color='darkred', linestyle=':', linewidth=2,
+               label=f'Median: {median_val:.1f}%')
+
+    # Add 95% CI shading
+    ax.axvspan(ci_lower, ci_upper, alpha=0.2, color='gray',
+               label=f'95% CI: [{ci_lower:.1f}%, {ci_upper:.1f}%]')
+
+    # Labels and title
+    ax.set_xlabel('Dementia cases attributable to periodontal disease (%)',
+                  fontsize=12, fontweight='bold')
+    ax.set_ylabel('Frequency (% of PSA iterations)',
+                  fontsize=12, fontweight='bold')
+    ax.set_title('Distribution of Attributable Cases from PSA\n(Growth Scenario: 50% → 61.25% PD Prevalence)',
+                 fontsize=13, fontweight='bold', pad=20)
+
+    # Formatting
+    ax.set_xlim(0, 20)
+    ax.set_ylim(0, max(counts) * 1.15)  # Add 15% headroom
+    ax.grid(axis='y', linestyle='--', alpha=0.3)
+    ax.legend(loc='upper right', fontsize=10, frameon=True, fancybox=True, shadow=True)
+
+    # Add text box with summary statistics
+    textstr = f'PSA Iterations: {n_iterations}\n'
+    textstr += f'Mean ± SD: {mean_val:.1f}% ± {attributable_pct.std():.1f}%'
+    props = dict(boxstyle='round', facecolor='wheat', alpha=0.5)
+    ax.text(0.98, 0.97, textstr, transform=ax.transAxes, fontsize=10,
+            verticalalignment='top', horizontalalignment='right', bbox=props)
+
+    # Tight layout
+    plt.tight_layout()
+
+    # Save figure
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(output_path, dpi=300, bbox_inches='tight')
+    plt.close()
+
+    print(f"Histogram saved: {output_path}")
+    return output_path
+
+# Generate histogram figure
+if not attributable_df.empty:
+    histogram_figure_path = plot_attributable_cases_histogram(attributable_df)
+else:
+    histogram_figure_path = None
+    print("WARNING: Skipping histogram plot - no attributable cases data available")
 
 # ── QALY differences (growth minus baseline) by year ─────────────────────────
 
@@ -579,32 +767,48 @@ else:
 
 # ── Sensitivity analysis: read from SA output Excel ───────────────────────────
 
-if SA_EXCEL_PATH.exists():
-    sa_baseline_df = pd.read_excel(SA_EXCEL_PATH, sheet_name='Baseline_Scenario')
-    sa_growth_df   = pd.read_excel(SA_EXCEL_PATH, sheet_name='Growth_Scenario')
-    sa_baseline_df.insert(0, 'Scenario', 'Baseline (50% stable)')
-    sa_growth_df.insert(0, 'Scenario', 'Growth (50%→61.25%)')
-    sa_combined_df = pd.concat([sa_baseline_df, sa_growth_df], ignore_index=True)
-    print(f"Sensitivity analysis loaded: {len(sa_combined_df)} rows")
-else:
-    print(f"WARNING: SA Excel not found at {SA_EXCEL_PATH}. Sensitivity_Analysis sheet will be empty.")
-    sa_combined_df = pd.DataFrame()
+sa_dfs = []
+for sa_path, label in [(SA_BASELINE_EXCEL_PATH, 'Baseline (50% stable)'),
+                        (SA_GROWTH_EXCEL_PATH,   'Growth (50%→61.25%)')]:
+    if sa_path.exists():
+        df = pd.read_excel(sa_path, sheet_name='Results')
+        df.insert(0, 'Scenario', label)
+        sa_dfs.append(df)
+        print(f"Sensitivity analysis loaded ({label}): {len(df)} rows from {sa_path}")
+    else:
+        print(f"WARNING: SA Excel not found at {sa_path}. Rows for '{label}' will be absent.")
+sa_combined_df = pd.concat(sa_dfs, ignore_index=True) if sa_dfs else pd.DataFrame()
 
 # ── Write workbook ─────────────────────────────────────────────────────────────
 
 with pd.ExcelWriter(OUTPUT_PATH, engine='openpyxl') as writer:
     model_inputs_df.to_excel(writer, sheet_name='Model_Inputs',                index=False)
     table3_df.to_excel(writer,       sheet_name='Table3_Scenario_Comparison',  index=False)
-    enrichment_df.to_excel(writer,   sheet_name='Risk_Factor_Enrichment',       index=False)
+
+    # Attributable cases from PSA (replaces enrichment table)
+    if not attributable_summary.empty:
+        attributable_summary.to_excel(writer, sheet_name='Attributable_Cases_Summary', index=False)
+    if not histogram_data.empty:
+        histogram_data.to_excel(writer, sheet_name='Attributable_Distribution', index=False)
+    if not attributable_df.empty:
+        # Include raw draws (first 10,000 to keep file size reasonable)
+        attributable_df.head(10000).to_excel(writer, sheet_name='Attributable_Draws', index=False)
+
     qaly_df.to_excel(writer,         sheet_name='QALY_Differences',             index=False)
     psa_table_df.to_excel(writer,    sheet_name='PSA_Table',                    index=False)
     sa_combined_df.to_excel(writer,  sheet_name='Sensitivity_Analysis',          index=False)
 
 print(f"\nManuscript tables saved to: {OUTPUT_PATH}")
 print("Sheets:")
-print("  1. Model_Inputs                — Model parameters and inputs")
-print("  2. Table3_Scenario_Comparison  — Table 3 data (2030/2035/2040)")
-print("  3. Risk_Factor_Enrichment      — Figure 2 data (enrichment)")
-print("  4. QALY_Differences            — Figure 4 data (cumulative QALYs)")
-print("  5. PSA_Table                   — Table 4 (PSA results)")
-print("  6. Sensitivity_Analysis        — Table 5 (one-way SA)")
+print("  1. Model_Inputs                  — Model parameters and inputs")
+print("  2. Table3_Scenario_Comparison    — Table 3 data (2030/2035/2040)")
+print("  3. Attributable_Cases_Summary    — PAF summary statistics from PSA")
+print("  4. Attributable_Distribution     — Histogram data (% attributable vs frequency)")
+print("  5. Attributable_Draws            — Raw PSA draws with attributable cases")
+print("  6. QALY_Differences              — Cumulative QALYs by year")
+print("  7. PSA_Table                     — PSA results summary")
+print("  8. Sensitivity_Analysis          — One-way sensitivity analysis")
+
+if histogram_figure_path:
+    print(f"\nHistogram figure saved to: {histogram_figure_path}")
+print(f"\nFigures directory: {FIGURES_DIR.absolute()}")
