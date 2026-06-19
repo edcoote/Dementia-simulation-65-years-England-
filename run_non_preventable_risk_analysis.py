@@ -18,6 +18,7 @@ from IBM_PD_AD_v3 import (
     general_config,
     run_model,
     extract_psa_metrics,
+    load_results_compressed,
 )
 
 
@@ -70,6 +71,8 @@ def build_counterfactual_config(cfg: dict) -> dict:
             continue
         _zero_prevalence(meta)
         _neutralise_hazard_ratios(meta)
+        if isinstance(meta.get('prevalence_schedule'), dict):
+            meta['prevalence_schedule']['use'] = False
     return cf
 
 
@@ -107,8 +110,19 @@ def summarise(metrics_baseline: dict, metrics_cf: dict) -> pd.DataFrame:
 
 
 def main():
-    print("Running baseline model...")
-    baseline_results = run_model(general_config, seed=DEFAULT_SEED)
+    if RESULTS_PATH.exists():
+        print(f"Output already exists — skipping: {RESULTS_PATH}")
+        return
+
+    baseline_pkl = Path("results") / "results_pd_baseline.pkl.gz"
+    if baseline_pkl.exists():
+        print(f"Loading baseline model from {baseline_pkl}...")
+        baseline_results = load_results_compressed(baseline_pkl)
+    else:
+        print("Running baseline model (results_pd_baseline.pkl.gz not found)...")
+        stable_cfg = copy.deepcopy(general_config)
+        stable_cfg['risk_factors']['periodontal_disease']['prevalence_schedule']['use'] = False
+        baseline_results = run_model(stable_cfg, seed=DEFAULT_SEED)
     baseline_metrics = extract_psa_metrics(baseline_results)
 
     print("Building counterfactual with preventable risks removed...")
