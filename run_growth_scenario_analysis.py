@@ -124,28 +124,28 @@ def step_1_main_model_run(logger: Logger, config: dict) -> bool:
     logger.log("Adjusted to model timeframe: 22.5% increase over 17 years")
 
     try:
-        from IBM_PD_AD_v3 import general_config, run_model, save_results_compressed, export_results_to_excel
+        from IBM_PD_AD_v3 import general_config, run_model, save_results_compressed, load_results_compressed, export_results_to_excel
 
-        pop_fraction = config['population_fraction']
         seed = config['seed']
         output_dir = config['output_dir'] / "main_model_run"
         output_dir.mkdir(parents=True, exist_ok=True)
 
-        # Create config with growth scenario enabled
-        run_config = enable_growth_scenario(general_config)
-
-        if pop_fraction < 1.0:
-            run_config['population'] = int(run_config['population'] * pop_fraction)
-
-        logger.log(f"Running model with {run_config['population']:,} individuals...")
-
-        # Run model
-        results = run_model(run_config, seed=seed, return_agents=False)
-
-        # Save compressed results (matches baseline structure)
-        output_file = output_dir / "results_pd_growth.pkl.gz"
-        save_results_compressed(results, output_file)
-        logger.log(f"  ✓ Compressed results saved: {output_file}")
+        # Load pre-computed results from run_baseline_and_scenarios.py if available
+        baseline_growth_pkl = Path("results") / "results_pd_growth.pkl.gz"
+        if baseline_growth_pkl.exists():
+            logger.log(f"Loading pre-computed growth model results from {baseline_growth_pkl}...")
+            results = load_results_compressed(baseline_growth_pkl)
+            logger.log("  ✓ Loaded (skipping re-run)")
+        else:
+            pop_fraction = config['population_fraction']
+            run_config = enable_growth_scenario(general_config)
+            if pop_fraction < 1.0:
+                run_config['population'] = int(run_config['population'] * pop_fraction)
+            logger.log(f"Running model with {run_config['population']:,} individuals...")
+            results = run_model(run_config, seed=seed, return_agents=False)
+            output_file = output_dir / "results_pd_growth.pkl.gz"
+            save_results_compressed(results, output_file)
+            logger.log(f"  ✓ Compressed results saved: {output_file}")
 
         # Export to Excel (matches baseline structure: results/Baseline_Model_PD_{prevalence}.xlsx)
         excel_file = Path("results") / "Baseline_Model_PD_Growth.xlsx"
@@ -174,6 +174,7 @@ def step_2_psa_growth(logger: Logger, config: dict) -> bool:
             general_config,
             run_probabilistic_sensitivity_analysis,
             save_results_compressed,
+            load_results_compressed,
         )
 
         logger.log(f"PSA iterations: {config['psa_iterations']}")
@@ -222,34 +223,37 @@ def step_2_psa_growth(logger: Logger, config: dict) -> bool:
         })
         psa_config['psa'] = psa_cfg
 
-        # Run PSA
-        logger.log(f"\nStarting PSA with {PSA_ITERATIONS} iterations...")
-        logger.log(f"  - Growth scenario enabled (50% → 61.25%)")
-        logger.log(f"  - Population per iteration: {scaled_population:,}")
-        logger.log(f"  - Running sequentially (1 core)")
-        logger.log(f"  - Estimated time: 3-6 hours")
-        logger.log(f"  - Progress will be shown below...\n")
-
-        start_time = datetime.now()
-
-        psa_results = run_probabilistic_sensitivity_analysis(
-            psa_config,
-            psa_cfg,
-            collect_draw_level=True,
-            seed=SEED,
-            n_jobs=1,
-        )
-
-        end_time = datetime.now()
-        duration = (end_time - start_time).total_seconds()
-
-        # Save PSA results (matches baseline: psa_results_{prevalence}pct.pkl.gz)
+        # Load PSA results from run_psa_direct_v3.py if available (identical config/seed)
         psa_file = OUTPUT_DIR / 'psa_results_growth.pkl.gz'
-        save_results_compressed(psa_results, str(psa_file))
+        existing_psa_pkl = Path('psa_results_growth') / 'psa_results_growth.pkl.gz'
 
-        logger.log(f"\n✓ PSA complete for growth scenario!")
-        logger.log(f"✓ Duration: {duration/60:.1f} minutes ({duration/3600:.2f} hours)")
-        logger.log(f"✓ Results saved to: {psa_file.name}")
+        if existing_psa_pkl.exists():
+            logger.log(f"\nLoading pre-computed PSA results from {existing_psa_pkl}...")
+            logger.log(f"  (Produced by run_psa_direct_v3.py — same seed={SEED}, {PSA_ITERATIONS} iterations)")
+            psa_results = load_results_compressed(existing_psa_pkl)
+            logger.log(f"✓ PSA results loaded (skipping re-run)")
+            if str(psa_file) != str(existing_psa_pkl):
+                save_results_compressed(psa_results, str(psa_file))
+                logger.log(f"✓ Copied to: {psa_file}")
+        else:
+            logger.log(f"\nStarting PSA with {PSA_ITERATIONS} iterations...")
+            logger.log(f"  - Growth scenario enabled (50% → 61.25%)")
+            logger.log(f"  - Population per iteration: {scaled_population:,}")
+            logger.log(f"  - Running sequentially (1 core)")
+            logger.log(f"  - Estimated time: 3-6 hours")
+            logger.log(f"  - Progress will be shown below...\n")
+
+            start_time = datetime.now()
+            psa_results = run_probabilistic_sensitivity_analysis(
+                psa_config,
+                psa_cfg,
+                collect_draw_level=True,
+                seed=SEED,
+                n_jobs=1,
+            )
+            duration = (datetime.now() - start_time).total_seconds()
+            save_results_compressed(psa_results, str(psa_file))
+            logger.log(f"\n✓ PSA complete in {duration/3600:.2f} hours — saved to: {psa_file.name}")
 
         # Scale results to full population
         logger.log("\nScaling results to full population...")
@@ -432,83 +436,67 @@ def step_2_psa_growth(logger: Logger, config: dict) -> bool:
 
 
 def step_3_tornado_growth(logger: Logger, config: dict) -> bool:
-    """Run one-way sensitivity analysis with growth scenario - deterministic full population runs"""
+    """One-way sensitivity analysis with growth scenario — loads pre-computed pkl results."""
     logger.section("STEP 3: One-Way Sensitivity Analysis (Growth Scenario)")
 
     try:
-        from IBM_PD_AD_v3 import general_config, run_model, extract_psa_metrics, _with_scaled_population_and_entrants
+        from IBM_PD_AD_v3 import general_config, run_model, extract_psa_metrics, load_results_compressed
 
-        logger.log("Approach: Full population, deterministic runs")
-        logger.log(f"Runs per HR value: {config['tornado_n_replicates']}")
+        logger.log("Approach: Load pre-computed full-population runs from run_baseline_and_scenarios.py")
         logger.log("Varying PD Onset HR (95% CI: 1.07-1.38)")
 
         seed = config['seed']
-        n_replicates = config['tornado_n_replicates']
-        pop_fraction = config['tornado_population_fraction']
         original_pop = general_config.get('population', 10787479)
-
-        # HR bounds from 95% CI
         hr_low = 1.07
         hr_high = 1.38
 
-        # Enable growth scenario
-        working_config = enable_growth_scenario(general_config)
-        working_config = _with_scaled_population_and_entrants(
-            working_config,
-            new_population=int(original_pop * pop_fraction),
-            original_population=original_pop
-        )
-        working_config.setdefault('psa', {})['original_population'] = original_pop
+        PKL_BASELINE = Path("results") / "results_pd_growth.pkl.gz"
+        PKL_LOW      = Path("results") / "results_pd_growth_hr_low.pkl.gz"
+        PKL_HIGH     = Path("results") / "results_pd_growth_hr_high.pkl.gz"
 
-        logger.log(f"\nPopulation: {int(original_pop * pop_fraction):,} agents")
+        def load_or_run(pkl_path: Path, run_cfg: dict, label: str) -> dict:
+            if pkl_path.exists():
+                logger.log(f"  Loading {label} from {pkl_path}...")
+                return load_results_compressed(pkl_path)
+            logger.log(f"  {pkl_path} not found — running {label} model...")
+            return run_model(run_cfg, seed=seed, return_agents=False)
 
-        def set_pd_hr(config: dict, onset_hr: float) -> dict:
-            """Set the PD onset hazard ratio"""
-            cfg = copy.deepcopy(config)
-            pd_meta = cfg['risk_factors']['periodontal_disease']
-            hr_map = pd_meta.setdefault('hazard_ratios', {})
+        def set_pd_hr(cfg: dict, onset_hr: float) -> dict:
+            c = copy.deepcopy(cfg)
+            hr_map = c['risk_factors']['periodontal_disease'].setdefault('hazard_ratios', {})
             hr_map.setdefault('onset', {})
             if isinstance(hr_map['onset'], dict):
                 hr_map['onset']['female'] = onset_hr
                 hr_map['onset']['male'] = onset_hr
             else:
                 hr_map['onset'] = {'female': onset_hr, 'male': onset_hr, 'all': onset_hr}
-            return cfg
+            return c
 
-        def run_scenario(cfg: dict, param_name: str, value_type: str) -> dict:
-            """Run a single deterministic scenario"""
-            result = run_model(cfg, seed=seed)
-            metrics = extract_psa_metrics(result)
-            metrics['parameter'] = param_name
-            metrics['value_type'] = value_type
-            metrics['replicate'] = 0
-            metrics['scenario'] = 'growth'
-            return metrics
+        base_growth_cfg = enable_growth_scenario(general_config)
+        baseline_result = load_or_run(PKL_BASELINE, base_growth_cfg, "baseline growth (HR=1.21)")
+        low_result      = load_or_run(PKL_LOW,      set_pd_hr(base_growth_cfg, hr_low),  f"growth HR={hr_low}")
+        high_result     = load_or_run(PKL_HIGH,     set_pd_hr(base_growth_cfg, hr_high), f"growth HR={hr_high}")
 
-        results_list = []
+        def make_metrics(result: dict, param_name: str, value_type: str) -> dict:
+            m = extract_psa_metrics(result)
+            m['parameter']  = param_name
+            m['value_type'] = value_type
+            m['replicate']  = 0
+            m['scenario']   = 'growth'
+            return m
 
-        # Baseline (base HR = 1.21)
-        logger.log("\nRunning baseline scenario (HR=1.21)...")
-        baseline_metrics = run_scenario(working_config, 'baseline', 'baseline')
-        results_list.append(baseline_metrics)
+        baseline_metrics = make_metrics(baseline_result, 'baseline', 'baseline')
+        low_metrics      = make_metrics(low_result,      'onset_hr',  'low')
+        high_metrics     = make_metrics(high_result,     'onset_hr',  'high')
+
         baseline_qalys = baseline_metrics['total_qalys_combined']
-        logger.log(f"  Baseline QALYs: {baseline_qalys:,.0f}")
+        low_qalys      = low_metrics['total_qalys_combined']
+        high_qalys     = high_metrics['total_qalys_combined']
+        logger.log(f"\n  Baseline QALYs (HR=1.21): {baseline_qalys:,.0f}")
+        logger.log(f"  Low HR QALYs  (HR={hr_low}):  {low_qalys:,.0f}  (Delta={low_qalys - baseline_qalys:+,.0f})")
+        logger.log(f"  High HR QALYs (HR={hr_high}): {high_qalys:,.0f}  (Delta={high_qalys - baseline_qalys:+,.0f})")
 
-        # Low HR
-        logger.log(f"\nRunning low HR scenario (HR={hr_low})...")
-        low_config = set_pd_hr(working_config, hr_low)
-        low_metrics = run_scenario(low_config, 'onset_hr', 'low')
-        results_list.append(low_metrics)
-        low_qalys = low_metrics['total_qalys_combined']
-        logger.log(f"  Low HR QALYs: {low_qalys:,.0f} (Delta={low_qalys - baseline_qalys:+,.0f})")
-
-        # High HR
-        logger.log(f"\nRunning high HR scenario (HR={hr_high})...")
-        high_config = set_pd_hr(working_config, hr_high)
-        high_metrics = run_scenario(high_config, 'onset_hr', 'high')
-        results_list.append(high_metrics)
-        high_qalys = high_metrics['total_qalys_combined']
-        logger.log(f"  High HR QALYs: {high_qalys:,.0f} (Delta={high_qalys - baseline_qalys:+,.0f})")
+        results_list = [baseline_metrics, low_metrics, high_metrics]
 
         # Combine results (no scaling needed - full population)
         df = pd.DataFrame(results_list)
