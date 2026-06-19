@@ -20,6 +20,7 @@ from IBM_PD_AD_v3 import (
     general_config,
     run_probabilistic_sensitivity_analysis,
     save_results_compressed,
+    load_results_compressed,
 )
 
 # ── Configuration ──────────────────────────────────────────────────────────────
@@ -76,23 +77,26 @@ psa_cfg.update({
 })
 psa_config['psa'] = psa_cfg
 
-# ── Run PSA ───────────────────────────────────────────────────────────────────
+# ── Run PSA (or load if already complete) ─────────────────────────────────────
 
-print(f"Running PSA: {PSA_ITERATIONS} iterations, {scaled_pop:,} agents per draw")
-start = datetime.now()
+PSA_PKL = OUTPUT_DIR / 'psa_results_growth.pkl.gz'
 
-psa_results = run_probabilistic_sensitivity_analysis(
-    psa_config,
-    psa_cfg,
-    collect_draw_level=True,
-    seed=SEED,
-    n_jobs=1,
-)
-
-duration_h = (datetime.now() - start).total_seconds() / 3600
-print(f"PSA complete in {duration_h:.2f} hours")
-
-save_results_compressed(psa_results, OUTPUT_DIR / 'psa_results_growth.pkl.gz')
+if PSA_PKL.exists():
+    print(f"PSA pkl already exists — loading and re-exporting Excel only: {PSA_PKL}")
+    psa_results = load_results_compressed(PSA_PKL)
+else:
+    print(f"Running PSA: {PSA_ITERATIONS} iterations, {scaled_pop:,} agents per draw")
+    start = datetime.now()
+    psa_results = run_probabilistic_sensitivity_analysis(
+        psa_config,
+        psa_cfg,
+        collect_draw_level=True,
+        seed=SEED,
+        n_jobs=1,
+    )
+    duration_h = (datetime.now() - start).total_seconds() / 3600
+    print(f"PSA complete in {duration_h:.2f} hours")
+    save_results_compressed(psa_results, PSA_PKL)
 
 # ── Scale draws ───────────────────────────────────────────────────────────────
 
