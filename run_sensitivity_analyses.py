@@ -95,35 +95,98 @@ def enable_growth_scenario(config: dict) -> dict:
 # ============================================================================
 
 def run_baseline_sensitivity(logger: Logger, config: dict) -> bool:
-    """Run one-way sensitivity analysis for baseline scenario (50% stable)"""
+    """One-way SA for baseline scenario — loads baseline from pkl, runs only HR=1.07/1.38."""
     logger.section("ANALYSIS 1: Baseline Scenario (50% Stable PD Prevalence)")
-    logger.log("Approach: Full population, deterministic")
-    logger.log("HR values: 1.07 (low), 1.21 (baseline), 1.38 (high)")
-    logger.log("Estimated time: ~3 hours")
+
+    excel_file = Path('pd_sensitivity_analysis.xlsx')
+    if excel_file.exists():
+        logger.log(f"Output already exists — skipping: {excel_file}")
+        return True
+
+    logger.log("Approach: Load baseline from pkl; run HR=1.07 and HR=1.38 only")
+    logger.log("HR values: 1.07 (low), 1.21 (baseline loaded), 1.38 (high)")
     logger.log("")
 
     try:
-        from IBM_PD_AD_v3 import general_config
-        from pd_sensitivity_analysis import run_pd_sensitivity_analysis
+        import pandas as pd
+        from IBM_PD_AD_v3 import general_config, run_model, extract_psa_metrics, load_results_compressed
 
-        # Run baseline sensitivity analysis
-        results = run_pd_sensitivity_analysis(
-            general_config,
-            population_fraction=1.0,    # Full population
-            n_replicates=1,             # Single deterministic run per HR value
-            combine_sexes=True,
-            seed=config['seed'],
-            paired_seeds=True,          # Use same seed across HR values
-            prevalence_values=[0.50],   # Baseline: 50% stable prevalence
-            n_jobs=1,                   # Sequential runs
-            auto_export=True,           # Auto-export to Excel
-            export_path=Path('pd_sensitivity_analysis.xlsx'),
-            show_progress=True
-        )
+        seed = config['seed']
+        original_pop = general_config.get('population', 10787479)
+        hr_low  = 1.07
+        hr_high = 1.38
 
-        logger.log("✓ Baseline sensitivity analysis complete!")
-        logger.log(f"✓ Results saved to: pd_sensitivity_analysis.xlsx")
-        logger.log(f"  - {len(results)} scenarios completed")
+        def set_pd_hr(cfg: dict, onset_hr: float) -> dict:
+            c = copy.deepcopy(cfg)
+            hr_map = c['risk_factors']['periodontal_disease'].setdefault('hazard_ratios', {})
+            hr_map.setdefault('onset', {})
+            if isinstance(hr_map['onset'], dict):
+                hr_map['onset']['female'] = onset_hr
+                hr_map['onset']['male'] = onset_hr
+            else:
+                hr_map['onset'] = {'female': onset_hr, 'male': onset_hr, 'all': onset_hr}
+            return c
+
+        def make_metrics(result: dict, param_name: str, value_type: str, prevalence: float) -> dict:
+            m = extract_psa_metrics(result)
+            m['parameter']  = param_name
+            m['value_type'] = value_type
+            m['replicate']  = 0
+            m['prevalence'] = prevalence
+            return m
+
+        # Baseline (HR=1.21, 50% stable) — load from run_baseline_and_scenarios.py
+        baseline_pkl = Path("results") / "results_pd_baseline.pkl.gz"
+        if baseline_pkl.exists():
+            logger.log(f"Loading baseline from {baseline_pkl}...")
+            baseline_result = load_results_compressed(baseline_pkl)
+        else:
+            logger.log("results_pd_baseline.pkl.gz not found — running baseline model...")
+            stable_cfg = copy.deepcopy(general_config)
+            stable_cfg['risk_factors']['periodontal_disease']['prevalence_schedule']['use'] = False
+            baseline_result = run_model(stable_cfg, seed=seed, return_agents=False)
+
+        baseline_metrics = make_metrics(baseline_result, 'baseline', 'baseline', 0.50)
+        baseline_qalys   = baseline_metrics['total_qalys_combined']
+        logger.log(f"  Baseline QALYs (HR=1.21): {baseline_qalys:,.0f}")
+
+        # Build stable base config (prevalence schedule off) for HR variants
+        stable_base = copy.deepcopy(general_config)
+        stable_base['risk_factors']['periodontal_disease']['prevalence_schedule']['use'] = False
+
+        # Low HR (1.07, 50% stable) — new run
+        logger.log(f"\nRunning low HR scenario (HR={hr_low})...")
+        low_cfg     = set_pd_hr(stable_base, hr_low)
+        low_result  = run_model(low_cfg, seed=seed, return_agents=False)
+        low_metrics = make_metrics(low_result, 'onset_hr', 'low', 0.50)
+        low_qalys   = low_metrics['total_qalys_combined']
+        logger.log(f"  Low HR QALYs (HR={hr_low}): {low_qalys:,.0f}  (Delta={low_qalys - baseline_qalys:+,.0f})")
+
+        # High HR (1.38, 50% stable) — new run
+        logger.log(f"\nRunning high HR scenario (HR={hr_high})...")
+        high_cfg     = set_pd_hr(stable_base, hr_high)
+        high_result  = run_model(high_cfg, seed=seed, return_agents=False)
+        high_metrics = make_metrics(high_result, 'onset_hr', 'high', 0.50)
+        high_qalys   = high_metrics['total_qalys_combined']
+        logger.log(f"  High HR QALYs (HR={hr_high}): {high_qalys:,.0f}  (Delta={high_qalys - baseline_qalys:+,.0f})")
+
+        df = pd.DataFrame([baseline_metrics, low_metrics, high_metrics])
+        excel_file = Path('pd_sensitivity_analysis.xlsx')
+        with pd.ExcelWriter(excel_file, engine='openpyxl') as writer:
+            df.to_excel(writer, sheet_name='Results', index=False)
+            metadata = {
+                'Parameter': ['Analysis Type', 'Scenario', 'HR Low', 'HR Baseline', 'HR High',
+                               'Population', 'Random Seed', 'Date Generated'],
+                'Value':     ['One-Way Sensitivity Analysis (Deterministic)',
+                               'Baseline (50% stable PD prevalence)',
+                               hr_low, 1.21, hr_high,
+                               f'{original_pop:,}', seed,
+                               datetime.now().strftime('%Y-%m-%d %H:%M:%S')],
+            }
+            pd.DataFrame(metadata).to_excel(writer, sheet_name='Metadata', index=False)
+
+        logger.log(f"\n✓ Baseline sensitivity analysis complete!")
+        logger.log(f"✓ Results saved to: {excel_file}")
         logger.log("")
         return True
 
@@ -134,130 +197,96 @@ def run_baseline_sensitivity(logger: Logger, config: dict) -> bool:
 
 
 def run_growth_sensitivity(logger: Logger, config: dict) -> bool:
-    """Run one-way sensitivity analysis for growth scenario (50% → 61.25%)"""
+    """One-way SA for growth scenario — loads all three HR variants from pre-computed pkls."""
     logger.section("ANALYSIS 2: Growth Scenario (50% → 61.25% PD Prevalence)")
-    logger.log("Approach: Full population, deterministic")
+
+    excel_file = Path('pd_sensitivity_analysis_growth.xlsx')
+    if excel_file.exists():
+        logger.log(f"Output already exists — skipping: {excel_file}")
+        return True
+
+    logger.log("Approach: Load pre-computed full-population runs from run_baseline_and_scenarios.py")
     logger.log("HR values: 1.07 (low), 1.21 (baseline), 1.38 (high)")
-    logger.log("Prevalence: 50% (2023) → 61.25% (2040)")
-    logger.log("Based on: Elamin & Anash (2023) projections")
-    logger.log("Estimated time: ~3 hours")
     logger.log("")
 
     try:
-        from IBM_PD_AD_v3 import general_config, run_model, extract_psa_metrics
         import pandas as pd
+        from IBM_PD_AD_v3 import general_config, run_model, extract_psa_metrics, load_results_compressed
 
         seed = config['seed']
         original_pop = general_config.get('population', 10787479)
-
-        # HR bounds from 95% CI
-        hr_low = 1.07
+        hr_low  = 1.07
         hr_high = 1.38
 
-        # Enable growth scenario
-        working_config = enable_growth_scenario(general_config)
-
-        logger.log(f"Population: {original_pop:,} agents")
-        logger.log("")
+        PKL_BASELINE = Path("results") / "results_pd_growth.pkl.gz"
+        PKL_LOW      = Path("results") / "results_pd_growth_hr_low.pkl.gz"
+        PKL_HIGH     = Path("results") / "results_pd_growth_hr_high.pkl.gz"
 
         def set_pd_hr(cfg: dict, onset_hr: float) -> dict:
-            """Set the PD onset hazard ratio"""
-            config_copy = copy.deepcopy(cfg)
-            pd_meta = config_copy['risk_factors']['periodontal_disease']
-            hr_map = pd_meta.setdefault('hazard_ratios', {})
+            c = copy.deepcopy(cfg)
+            hr_map = c['risk_factors']['periodontal_disease'].setdefault('hazard_ratios', {})
             hr_map.setdefault('onset', {})
             if isinstance(hr_map['onset'], dict):
                 hr_map['onset']['female'] = onset_hr
                 hr_map['onset']['male'] = onset_hr
             else:
                 hr_map['onset'] = {'female': onset_hr, 'male': onset_hr, 'all': onset_hr}
-            return config_copy
+            return c
 
-        def run_scenario(cfg: dict, param_name: str, value_type: str) -> dict:
-            """Run a single deterministic scenario"""
-            result = run_model(cfg, seed=seed)
-            metrics = extract_psa_metrics(result)
-            metrics['parameter'] = param_name
-            metrics['value_type'] = value_type
-            metrics['replicate'] = 0
-            metrics['scenario'] = 'growth'
-            return metrics
+        base_growth_cfg = enable_growth_scenario(general_config)
 
-        results_list = []
+        def load_or_run(pkl_path: Path, run_cfg: dict, label: str) -> dict:
+            if pkl_path.exists():
+                logger.log(f"  Loading {label} from {pkl_path}...")
+                return load_results_compressed(pkl_path)
+            logger.log(f"  {pkl_path} not found — running {label} model...")
+            return run_model(run_cfg, seed=seed, return_agents=False)
 
-        # Baseline (HR = 1.21)
-        logger.log("Running baseline scenario (HR=1.21)...")
-        baseline_metrics = run_scenario(working_config, 'baseline', 'baseline')
-        results_list.append(baseline_metrics)
+        baseline_result = load_or_run(PKL_BASELINE, base_growth_cfg,                    "baseline growth (HR=1.21)")
+        low_result      = load_or_run(PKL_LOW,      set_pd_hr(base_growth_cfg, hr_low),  f"growth HR={hr_low}")
+        high_result     = load_or_run(PKL_HIGH,     set_pd_hr(base_growth_cfg, hr_high), f"growth HR={hr_high}")
+
+        def make_metrics(result: dict, param_name: str, value_type: str) -> dict:
+            m = extract_psa_metrics(result)
+            m['parameter']  = param_name
+            m['value_type'] = value_type
+            m['replicate']  = 0
+            m['scenario']   = 'growth'
+            return m
+
+        baseline_metrics = make_metrics(baseline_result, 'baseline', 'baseline')
+        low_metrics      = make_metrics(low_result,      'onset_hr',  'low')
+        high_metrics     = make_metrics(high_result,     'onset_hr',  'high')
+
         baseline_qalys = baseline_metrics['total_qalys_combined']
-        logger.log(f"  ✓ Baseline QALYs: {baseline_qalys:,.0f}")
-        logger.log("")
+        low_qalys      = low_metrics['total_qalys_combined']
+        high_qalys     = high_metrics['total_qalys_combined']
+        logger.log(f"  Baseline QALYs (HR=1.21): {baseline_qalys:,.0f}")
+        logger.log(f"  Low HR QALYs  (HR={hr_low}):  {low_qalys:,.0f}  (Delta={low_qalys - baseline_qalys:+,.0f})")
+        logger.log(f"  High HR QALYs (HR={hr_high}): {high_qalys:,.0f}  (Delta={high_qalys - baseline_qalys:+,.0f})")
 
-        # Low HR
-        logger.log(f"Running low HR scenario (HR={hr_low})...")
-        low_config = set_pd_hr(working_config, hr_low)
-        low_metrics = run_scenario(low_config, 'onset_hr', 'low')
-        results_list.append(low_metrics)
-        low_qalys = low_metrics['total_qalys_combined']
-        logger.log(f"  ✓ Low HR QALYs: {low_qalys:,.0f} (Delta={low_qalys - baseline_qalys:+,.0f})")
-        logger.log("")
-
-        # High HR
-        logger.log(f"Running high HR scenario (HR={hr_high})...")
-        high_config = set_pd_hr(working_config, hr_high)
-        high_metrics = run_scenario(high_config, 'onset_hr', 'high')
-        results_list.append(high_metrics)
-        high_qalys = high_metrics['total_qalys_combined']
-        logger.log(f"  ✓ High HR QALYs: {high_qalys:,.0f} (Delta={high_qalys - baseline_qalys:+,.0f})")
-        logger.log("")
-
-        # Compile results
-        df = pd.DataFrame(results_list)
-        logger.log("Results compiled (full population, no scaling required)")
-        logger.log("")
-
-        # Export to Excel
+        df = pd.DataFrame([baseline_metrics, low_metrics, high_metrics])
         excel_file = Path('pd_sensitivity_analysis_growth.xlsx')
-        logger.log(f"Exporting results to {excel_file}...")
 
         with pd.ExcelWriter(excel_file, engine='openpyxl') as writer:
             df.to_excel(writer, sheet_name='Results', index=False)
-
-            # Add metadata sheet
             metadata = {
-                'Parameter': [
-                    'Analysis Type',
-                    'Scenario',
-                    'Parameter Varied',
-                    'HR Low',
-                    'HR Baseline',
-                    'HR High',
-                    'Approach',
-                    'Population',
-                    'Prevalence',
-                    'Random Seed',
-                    'Date Generated'
-                ],
-                'Value': [
-                    'One-Way Sensitivity Analysis (Deterministic)',
-                    'Growth Scenario (Elamin & Anash 2023)',
-                    'PD Onset Hazard Ratio',
-                    hr_low,
-                    1.21,
-                    hr_high,
-                    'Full population, single deterministic run per HR value',
-                    f'{original_pop:,}',
-                    '50% (2023) → 61.25% (2040)',
-                    seed,
-                    datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                ]
+                'Parameter': ['Analysis Type', 'Scenario', 'Parameter Varied',
+                               'HR Low', 'HR Baseline', 'HR High',
+                               'Approach', 'Population', 'Prevalence',
+                               'Random Seed', 'Date Generated'],
+                'Value':     ['One-Way Sensitivity Analysis (Deterministic)',
+                               'Growth Scenario (Elamin & Anash 2023)',
+                               'PD Onset Hazard Ratio',
+                               hr_low, 1.21, hr_high,
+                               'Full population, loaded from pre-computed pkl files',
+                               f'{original_pop:,}', '50% (2023) → 61.25% (2040)',
+                               seed, datetime.now().strftime('%Y-%m-%d %H:%M:%S')],
             }
-            metadata_df = pd.DataFrame(metadata)
-            metadata_df.to_excel(writer, sheet_name='Metadata', index=False)
+            pd.DataFrame(metadata).to_excel(writer, sheet_name='Metadata', index=False)
 
-        logger.log(f"✓ Growth sensitivity analysis complete!")
+        logger.log(f"\n✓ Growth sensitivity analysis complete!")
         logger.log(f"✓ Results saved to: {excel_file}")
-        logger.log(f"  Sheets: Results, Metadata")
         logger.log("")
         return True
 
